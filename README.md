@@ -2,7 +2,7 @@
 
 API REST didattica per imparare i concetti fondamentali di FastAPI e PostgreSQL.
 
-Concetti trattati: [README-API.md](README-API.md) · [README-DB.md](README-DB.md)
+Concetti trattati: [README-API.md](README-API.md) · [README-DB.md](README-DB.md) · [README-Docker.md](README-Docker.md)
 
 ---
 
@@ -19,30 +19,36 @@ app/
     └── jobs.py          # Endpoint per il tracking dei job asincroni
 ```
 
-## Prerequisiti
+## Avvio con Docker (consigliato)
 
-PostgreSQL in esecuzione. Il modo più semplice con Docker:
+Nessun prerequisito — Docker gestisce tutto, incluso PostgreSQL.
 
 ```bash
+docker compose up --build
+```
+
+Il server parte su <http://127.0.0.1:8000>. Per fermare: `docker compose down`.
+
+Per approfondire Docker e Docker Compose → [README-Docker.md](README-Docker.md).
+
+## Avvio in locale (modalità sviluppo)
+
+Utile per sviluppare con auto-reload. Richiede PostgreSQL già in esecuzione.
+
+```bash
+# 1. Avvia solo il DB con Docker
 docker run --name pgdemo \
   -e POSTGRES_PASSWORD=yourpassword \
   -e POSTGRES_DB=products_db \
   -p 5432:5432 -d postgres:16
-```
 
-## Avvio rapido
-
-```bash
-# 1. Clona il repo e spostati nella cartella
-cd FastAPI
-
-# 2. Aggiorna .env con le tue credenziali PostgreSQL
+# 2. Verifica che .env punti a localhost
 DATABASE_URL=postgresql+psycopg2://postgres:yourpassword@localhost:5432/products_db
 
 # 3. Installa le dipendenze con uv
 uv sync
 
-# 4. Avvia il server di sviluppo
+# 4. Avvia il server di sviluppo (auto-reload su salvataggio)
 uv run fastapi dev app/main.py
 ```
 

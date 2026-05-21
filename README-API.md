@@ -4,6 +4,176 @@ Concetti trattati in questo progetto relativi al layer HTTP e alla struttura del
 
 ---
 
+## Fondamenti HTTP
+
+**HTTP** (HyperText Transfer Protocol) è il protocollo di comunicazione su cui si basano le API REST. Funziona come un dialogo **request/response** tra un client e un server:
+
+1. Il client invia una **request** con un metodo, un URL, degli header opzionali e un body opzionale.
+2. Il server elabora la richiesta e risponde con uno **status code**, degli header e un body opzionale.
+
+### Caratteristiche fondamentali
+
+| Proprietà | Significato |
+|---|---|
+| **Stateless** | Ogni richiesta è indipendente. Il server non ricorda le richieste precedenti — tutta l'informazione necessaria deve essere nella richiesta stessa. |
+| **Client-server** | Separazione netta: il client si occupa della presentazione, il server dei dati e della logica. |
+| **Uniform interface** | Interfaccia standardizzata: metodi HTTP, URL, status code e header hanno semantica definita dalla specifica. |
+
+### Header HTTP principali
+
+Gli header trasportano metadati sulla richiesta o sulla risposta, separati dal body:
+
+```
+Content-Type: application/json   # formato del body inviato
+Accept: application/json         # formato accettato in risposta
+Authorization: Bearer <token>    # credenziali di accesso
+```
+
+FastAPI imposta automaticamente `Content-Type: application/json` su tutte le risposte JSON. Il client deve inviare lo stesso header quando manda un body.
+
+---
+
+## Risorse e URL design
+
+In REST l'URL identifica **cosa** si sta manipolando (la risorsa), non **come** (l'azione). L'azione è espressa dal metodo HTTP.
+
+### Regole di naming
+
+| Regola | Corretto | Da evitare |
+|---|---|---|
+| **Sostantivi, non verbi** | `/products` | `/getProducts`, `/deleteProduct` |
+| **Plurale per le collezioni** | `/products` | `/product` |
+| **Minuscolo con trattini** | `/product-categories` | `/ProductCategories` |
+| **Gerarchia con slash** | `/products/{id}/restock` | `/restockProduct?id=5` |
+
+### Risorse gerarchiche
+
+Quando una risorsa appartiene a un'altra, l'URL rispecchia la gerarchia:
+
+```
+/products                   → collezione di tutti i prodotti
+/products/{id}              → un singolo prodotto
+/products/{id}/restock      → azione specifica su un prodotto
+```
+
+La profondità va limitata a **due livelli** oltre la collezione radice. Gerarchie più profonde diventano difficili da leggere e da mantenere.
+
+### Path vs query parameter
+
+| Tipo | Uso | Esempio |
+|---|---|---|
+| **Path parameter** | Identifica una risorsa specifica | `/products/42` |
+| **Query parameter** | Filtra, ordina, pagina una collezione | `/products?category=libri&min_price=10` |
+
+---
+
+## Request e Response body
+
+Il **body** è il payload trasportato dalla richiesta o dalla risposta. Nel progetto si usa sempre JSON (`application/json`).
+
+### Request body
+
+Inviato dal client nelle operazioni che creano o modificano dati (`POST`, `PUT`, `PATCH`). Deve corrispondere allo schema Pydantic dichiarato nell'endpoint:
+
+```json
+// POST /products — body atteso
+{
+  "name": "Tastiera meccanica",
+  "price": 89.99,
+  "category": "elettronica",
+  "stock": 15
+}
+```
+
+FastAPI legge il body, lo passa a Pydantic per la validazione e inietta il modello validato nell'endpoint. Se il body è malformato o mancano campi obbligatori, risponde `422` in automatico, senza codice manuale.
+
+### Response body
+
+Restituito dal server, serializzato dal modello dichiarato in `response_model`. Garantisce che solo i campi autorizzati vengano esposti:
+
+```json
+// risposta — include l'id generato dal server
+{
+  "id": 4,
+  "name": "Tastiera meccanica",
+  "price": 89.99,
+  "category": "elettronica",
+  "stock": 15
+}
+```
+
+**Alcune risposte non hanno body** — `DELETE` risponde `204 No Content` con body vuoto. In FastAPI si dichiara `response_model=None` e si ritorna `None` (o nulla) dall'endpoint.
+
+### Serializzazione Pydantic
+
+```
+request JSON  →  Pydantic model (validazione)  →  Python dict / oggetto
+Python dict   →  Pydantic model (response_model) →  response JSON
+```
+
+Pydantic gestisce la conversione in entrambe le direzioni. Lo stesso schema che valida l'input documenta automaticamente il contratto nella Swagger UI.
+
+---
+
+## Error handling
+
+Le API REST comunicano gli errori attraverso **status code HTTP** e un body JSON con il dettaglio dell'errore. Il client non deve fare parsing del testo — il codice è sufficiente a capire cosa fare.
+
+### Categorie di errori
+
+| Range | Categoria | Chi sbaglia |
+|---|---|---|
+| `4xx` | Client error | Il client ha fatto una richiesta non valida |
+| `5xx` | Server error | Il server ha avuto un problema interno |
+
+### Status code di errore usati nel progetto
+
+| Codice | Quando | Come viene generato |
+|---|---|---|
+| `404 Not Found` | ID inesistente | `raise HTTPException(status_code=404)` |
+| `422 Unprocessable Entity` | Body o parametri invalidi | Automatico da FastAPI+Pydantic |
+
+### `HTTPException` in FastAPI
+
+L'unico meccanismo di errore esplicito nel codice. Interrompe immediatamente l'esecuzione dell'endpoint e fa rispondere FastAPI con il body standard:
+
+```python
+raise HTTPException(
+    status_code=status.HTTP_404_NOT_FOUND,
+    detail=f"Product {product_id} not found",
+)
+```
+
+Body della risposta generata automaticamente:
+
+```json
+{"detail": "Product 42 not found"}
+```
+
+### Errori 422 automatici
+
+FastAPI intercetta i `ValidationError` di Pydantic e li trasforma in `422` con un body strutturato che elenca ogni campo invalido, il valore ricevuto e il motivo del rifiuto. Zero righe di codice manuale.
+
+```json
+{
+  "detail": [
+    {
+      "loc": ["body", "price"],
+      "msg": "Input should be greater than 0",
+      "type": "greater_than"
+    }
+  ]
+}
+```
+
+### Cosa NON fare
+
+- **Non usare `200` per gli errori** — alcuni client ignorano il body e si basano solo sul codice.
+- **Non esporre dettagli interni** nei `5xx` (stack trace, query SQL, percorsi di file) — queste informazioni aiutano gli attaccanti.
+- **Non inventare status code** — usare solo i codici definiti dalla specifica HTTP.
+
+---
+
 ## REST — princìpi base
 
 **REST** (Representational State Transfer) è uno stile architetturale per API HTTP basato su tre regole:
