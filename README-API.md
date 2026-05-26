@@ -380,6 +380,151 @@ def health(db: Session = Depends(get_db)):
 
 ---
 
+## Concorrenza asincrona — servire migliaia di utenti
+
+### Il problema: I/O sincrono blocca l'event loop
+
+FastAPI gira su un **event loop asyncio** (gestito da Uvicorn). L'event loop esegue i coroutine uno alla volta, **ma può passare da uno all'altro mentre aspettano I/O**. Se un endpoint fa I/O *sincrono* (query DB bloccante, HTTP call, lettura file), blocca l'intero loop: nessun'altra richiesta viene servita finché quell'operazione non finisce.
+
+```
+# PROBLEMA — psycopg2 (sync) blocca il loop:
+def get_product(db: Session = Depends(get_db)):
+    return db.get(ProductORM, product_id)   # ← blocca per 5–50 ms
+    # In questo tempo: ZERO altre richieste servite
+
+# SOLUZIONE — asyncpg + AsyncSession non blocca:
+async def get_product(db: AsyncSession = Depends(get_db)):
+    return await database.get(db, product_id)   # ← cede il controllo
+    # In questo tempo: l'event loop serve N altre richieste
+```
+
+### I/O-bound vs CPU-bound
+
+| Tipo di task | Esempio | Come gestirlo |
+|---|---|---|
+| **I/O-bound** | Query DB, HTTP call, lettura file | `async def` + libreria async (`asyncpg`, `httpx`) |
+| **CPU-bound leggero** | Calcolo in-memory, dict lookup | `def` normale (FastAPI lo manda in threadpool) |
+| **CPU-bound pesante** | ML inference, encoding video | `ProcessPoolExecutor` o worker separato |
+
+Regola pratica: **se il codice aspetta qualcosa di esterno → async**.
+
+### Stack async usato nel progetto
+
+```
+HTTP Request
+    ↓
+Uvicorn (ASGI server)
+    ↓
+FastAPI (async def endpoint)
+    ↓
+SQLAlchemy AsyncSession
+    ↓
+asyncpg (driver PostgreSQL nativo async)
+    ↓
+PostgreSQL
+```
+
+Ogni livello è non-bloccante: l'event loop può servire migliaia di
+richieste concorrenti con un singolo processo Python.
+
+### `AsyncSession` e `create_async_engine` — [database.py](app/database.py)
+
+```python
+engine = create_async_engine(
+    DATABASE_URL,          # postgresql+asyncpg://...
+    pool_size=20,          # connessioni permanenti nel pool
+    max_overflow=10,       # extra connessioni quando il pool è pieno
+    pool_timeout=30,       # secondi di attesa per una connessione libera
+    pool_recycle=1800,     # ricicla connessioni ogni 30 min (anti stale-TCP)
+    pool_pre_ping=True,    # SELECT 1 prima di usare una connessione dal pool
+)
+
+AsyncSessionLocal = async_sessionmaker(
+    engine,
+    class_=AsyncSession,
+    expire_on_commit=False,   # CRITICO: impedisce lazy-load impliciti dopo commit
+)
+```
+
+`expire_on_commit=False` è fondamentale: con il layer sync, dopo un `commit()` SQLAlchemy "scade" gli attributi ORM e li ricarica al prossimo accesso. In async questo reload implicito è impossibile (richiederebbe un `await` invisibile) e solleva `MissingGreenlet`. Con `False` gli attributi rimangono validi.
+
+### `asyncio.gather()` — I/O parallelo — [database.py](app/database.py)
+
+```python
+async def get_many(product_ids: list[int]) -> list[ProductORM | None]:
+    async def _fetch_one(pid: int) -> ProductORM | None:
+        async with AsyncSessionLocal() as session:   # sessione indipendente
+            return await session.get(ProductORM, pid)
+
+    # Le N query partono simultaneamente:
+    # t_totale = max(t1, t2, ..., tN)  invece di  sum(t1, t2, ..., tN)
+    return list(await asyncio.gather(*(_fetch_one(pid) for pid in product_ids)))
+```
+
+**Perché sessioni separate?** Una singola `AsyncSession` non è concurrency-safe: non può essere usata da più coroutine contemporaneamente. Per parallelizzare, ogni task prende la propria connessione dal pool.
+
+Esposto via `GET /products/compare?ids=1&ids=2&ids=3`.
+
+### `asyncio.Semaphore` — rate limiting — [routers/products.py](app/routers/products.py)
+
+```python
+_restock_semaphore = asyncio.Semaphore(5)   # max 5 restock concorrenti
+
+async def _restock_task(job_id, product_id, quantity):
+    async with _restock_semaphore:           # aspetta se ci sono già 5 in esecuzione
+        await asyncio.sleep(3)              # chiamata lenta al servizio esterno
+        async with AsyncSessionLocal() as db:
+            await database.update(db, product_id, {"stock": new_stock})
+```
+
+Senza semaphore, 1000 richieste di restock simultanee aprirebbero 1000 connessioni verso il servizio esterno. Il semaphore limita il burst a 5 concorrenti; le altre aspettano **senza bloccare il loop** (sono in pausa, non consumano CPU).
+
+### `asyncio.wait_for()` — timeout — [routers/products.py](app/routers/products.py)
+
+```python
+await asyncio.wait_for(
+    _restock_task(job_id, product_id, quantity),
+    timeout=30.0,   # se non finisce in 30s → TimeoutError
+)
+```
+
+Ogni operazione lenta deve avere un timeout. Senza di esso, un servizio esterno down terrà il coroutine in attesa per sempre, esaurendo il semaphore e poi il pool di connessioni.
+
+Python 3.11+ offre anche `asyncio.timeout()` come context manager:
+
+```python
+async with asyncio.timeout(30.0):
+    await _restock_task(...)
+```
+
+### `def` vs `async def` — quando usare quale
+
+| Caso | Dichiarazione | Perché |
+|---|---|---|
+| Query DB, HTTP call | `async def` | I/O-bound: cede il controllo mentre aspetta |
+| Lettura dict in-memory | `def` | Sync puro, nessun I/O; FastAPI usa threadpool |
+| Background task asincrono | `async def` | Deve usare `await` internamente |
+| Endpoint puramente CPU | `def` | FastAPI lo delega al threadpool automaticamente |
+
+FastAPI gestisce entrambi: i `def` sync vengono eseguiti in un `ThreadPoolExecutor` per non bloccare il loop; gli `async def` girano direttamente nell'event loop.
+
+### Schema riassuntivo
+
+```
+1000 richieste concorrenti
+        ↓
+   Event Loop (1 thread)
+   ├─ request_1: await db.get()  ─────── aspetta il DB ──────→ risponde
+   ├─ request_2: await db.list() ──────── aspetta il DB ─────→ risponde
+   ├─ ...                                (nel frattempo serve le altre)
+   └─ request_N: await db.create() ───── aspetta il DB ─────→ risponde
+
+Connection Pool (max 20+10 connessioni)
+   └─ ogni await db.* prende una connessione, la usa, la restituisce
+```
+
+---
+
 ## Documentazione automatica
 
 FastAPI genera automaticamente due endpoint di documentazione:

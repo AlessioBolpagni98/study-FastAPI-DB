@@ -1,20 +1,25 @@
 """
 Endpoint per consultare lo stato dei job asincroni.
 
-Perché un router separato?
---------------------------
-I job non sono una risorsa "prodotto": sono un concetto trasversale
-usabile da qualsiasi risorsa futura (ordini, fatture, export, ...).
-Tenerli in un router separato rispetta il principio di separazione
-delle responsabilità e li rende facilmente estendibili.
+Perché `def` e non `async def`?
+--------------------------------
+`get_job_status` non fa nessun I/O: legge un dict in memoria (`_jobs`),
+operazione puramente CPU/memoria che dura microsecondi. FastAPI esegue i
+`def` normali in un threadpool separato, ma per operazioni così brevi il
+costo del context-switch al threadpool supera il beneficio. Si usa `def`
+solo qui, dove è corretto.
+
+Regola pratica:
+  - I/O (DB, HTTP, file, socket)  → `async def` + libreria async
+  - CPU / memoria pura            → `def` (o `async def` se già nell'event loop)
 
 Pattern "polling":
 ------------------
-Il client fa polling su GET /jobs/{job_id} finché lo status
-non diventa "completed" o "failed". È il pattern più semplice.
-Alternative più sofisticate:
-  - Webhook: il server notifica il client quando ha finito.
-  - WebSocket / SSE: connessione persistente, il server "pushes" lo stato.
+Il client fa polling su GET /jobs/{job_id} finché lo status non diventa
+"completed" o "failed". Alternative più sofisticate per produzione:
+  - Server-Sent Events (SSE): connessione persistente, push dal server.
+  - WebSocket: canale bidirezionale full-duplex.
+  - Webhook: il server fa POST al client quando ha finito.
 """
 
 from fastapi import APIRouter, HTTPException, status

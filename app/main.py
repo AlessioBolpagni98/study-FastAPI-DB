@@ -1,19 +1,14 @@
 """
-Punto di ingresso dell'applicazione FastAPI.
+Punto di ingresso dell'applicazione FastAPI — versione async/production.
 
 Cosa succede qui
 ----------------
-1. Istanziamo l'oggetto `FastAPI`: è "l'applicazione" — registra le rotte,
-   gestisce il ciclo di vita, espone lo schema OpenAPI.
-2. Il `lifespan` esegue codice di setup all'avvio e teardown allo spegnimento.
-3. Definiamo due endpoint "globali" (root e health check).
-4. Includiamo il router dei prodotti: tutti i suoi endpoint vengono
-   "agganciati" all'app principale sotto il prefisso /products.
+1. Il `lifespan` asincrono crea le tabelle e inserisce i seed all'avvio.
+2. Gli endpoint globali (root, health) sono `async def`: non bloccano l'event loop.
+3. Il health check usa `AsyncSession` per verificare il DB senza blocking I/O.
 
 Come avviarlo
 -------------
-Dalla cartella del progetto, con il virtualenv attivo:
-
     fastapi dev app/main.py
 
 Poi apri http://127.0.0.1:8000/docs per la Swagger UI interattiva.
@@ -23,54 +18,65 @@ from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI
 from sqlalchemy import text
-from sqlalchemy.orm import Session
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.database import SessionLocal, get_db, seed_db
+from app import database
+from app.database import AsyncSessionLocal, get_db
 from app.routers import jobs, products
 
 
 # ---------------------------------------------------------------------------
-# Lifespan: setup e teardown dell'applicazione
+# Lifespan asincrono: setup e teardown dell'applicazione
 # ---------------------------------------------------------------------------
-# Il `lifespan` è un context manager asincrono che FastAPI esegue:
-#   - Il codice PRIMA del `yield` → all'avvio (prima di ricevere richieste).
-#   - Il codice DOPO il `yield`   → allo spegnimento (dopo l'ultima richiesta).
+# Il lifespan è un asynccontextmanager: FastAPI lo esegue all'avvio (codice
+# prima del yield) e allo spegnimento (codice dopo il yield).
 #
-# È il posto giusto per:
-#   - Inizializzare connessioni al DB, pool, client esterni.
-#   - Precaricare modelli ML in memoria.
-#   - Liberare risorse alla chiusura.
+# Con il layer async, le operazioni di startup devono essere anch'esse async:
+# - `database.init_db()` crea le tabelle via AsyncConnection
+# - `seed_db()` inserisce i dati via AsyncSession
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Avvio: inserisce i prodotti di esempio se la tabella è vuota.
-    with SessionLocal() as db:
-        seed_db(db)
+    # --- AVVIO ---
+    # 1. Crea le tabelle DDL se non esistono ancora.
+    #    (Non si può fare a livello di modulo con async engine.)
+    await database.init_db()
+
+    # 2. Inserisce i prodotti di esempio se la tabella è vuota.
+    async with AsyncSessionLocal() as db:
+        await database.seed_db(db)
+
     yield
-    # Spegnimento: nulla da fare esplicitamente — il connection pool
-    # di SQLAlchemy si chiude automaticamente quando il processo termina.
+
+    # --- SPEGNIMENTO ---
+    # Il connection pool di SQLAlchemy async si chiude automaticamente
+    # quando il processo termina. Nulla da fare esplicitamente.
+    #
+    # In produzione, qui si chiuderebbero eventuali client HTTP aperti
+    # (httpx.AsyncClient, aiohttp.ClientSession, ecc.).
 
 
-# I parametri `title`, `description`, `version` finiscono nella
-# Swagger UI e nello schema OpenAPI: documentano l'API per chi la usa.
 app = FastAPI(
-    title="Catalogo Prodotti — Demo FastAPI + PostgreSQL",
+    title="Catalogo Prodotti — Demo FastAPI Async",
     description=(
         "API REST didattica per imparare i concetti fondamentali di FastAPI: "
-        "metodi HTTP, status code, Pydantic, gestione errori, SQLAlchemy ORM."
+        "metodi HTTP, status code, Pydantic, gestione errori, SQLAlchemy Async ORM, "
+        "asyncio.gather(), Semaphore, wait_for(), StreamingResponse."
     ),
-    version="0.2.0",
+    version="0.3.0",
     lifespan=lifespan,
 )
 
-# "Monta" i router. Da questo momento tutti gli endpoint definiti nei
-# router sono raggiungibili sotto i rispettivi prefissi.
 app.include_router(products.router)
 app.include_router(jobs.router)
 
 
+# ---------------------------------------------------------------------------
+# Endpoint di meta
+# ---------------------------------------------------------------------------
+
 @app.get("/", tags=["meta"])
-def root():
-    """Endpoint di benvenuto. Utile per verificare al volo che il server sia vivo."""
+async def root():
+    """Endpoint di benvenuto — async perché non fa I/O ma è coerente."""
     return {
         "message": "Benvenuto! Vai su /docs per la documentazione interattiva.",
         "docs_url": "/docs",
@@ -79,15 +85,16 @@ def root():
 
 
 @app.get("/health", tags=["meta"])
-def health(db: Session = Depends(get_db)):
-    """Health check con verifica della connessione al database.
+async def health(db: AsyncSession = Depends(get_db)):
+    """Health check con verifica asincrona della connessione al database.
 
-    Esegue `SELECT 1`: la query più leggera possibile per verificare che
-    PostgreSQL sia raggiungibile. Se il DB è down, l'eccezione si propaga
-    e FastAPI risponde con 500 Internal Server Error.
+    `await db.execute(text("SELECT 1"))` non blocca l'event loop:
+    se il DB risponde lentamente, FastAPI può continuare a servire
+    altre richieste nel frattempo.
 
-    Pattern standard usato da load balancer e orchestratori (es. Kubernetes)
-    per sapere se il servizio è pronto a ricevere traffico.
+    Pattern standard per load balancer e orchestratori Kubernetes:
+    il readiness probe chiama questo endpoint; se risponde 200, il pod
+    è pronto a ricevere traffico.
     """
-    db.execute(text("SELECT 1"))
+    await db.execute(text("SELECT 1"))
     return {"status": "ok", "database": "connected"}

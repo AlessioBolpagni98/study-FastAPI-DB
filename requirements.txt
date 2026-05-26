@@ -1,4 +1,5 @@
 fastapi[standard]>=0.115
 sqlalchemy>=2.0
-psycopg2-binary
+asyncpg            # driver async per PostgreSQL (sostituisce psycopg2 nell'event loop)
+psycopg2-binary    # mantenuto per tool sincroni (Alembic, shell, seed offline)
 python-dotenv

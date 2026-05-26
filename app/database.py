@@ -1,118 +1,170 @@
 """
-Layer di accesso al database — PostgreSQL via SQLAlchemy.
+Layer di accesso al database — PostgreSQL via SQLAlchemy Async.
+
+Perché async?
+-------------
+FastAPI gira su un event loop asyncio (via Uvicorn/Starlette). Quando un
+endpoint fa I/O sincrono (query DB, HTTP call, lettura file), **blocca
+l'intero event loop**: nessun'altra richiesta può essere servita finché
+quella operazione non finisce. Con migliaia di utenti concorrenti, questo
+è un collo di bottiglia critico.
+
+La soluzione è usare driver e sessioni async: l'event loop "sospende"
+il coroutine che aspetta la risposta del DB e serve nel frattempo altre
+richieste — le riprende non appena il DB risponde.
+
+Stack async usato
+-----------------
+- `asyncpg`                  : driver PostgreSQL nativo async (sostituisce psycopg2)
+- `create_async_engine`      : engine che usa asyncpg sotto il cofano
+- `AsyncSession`             : sessione SQLAlchemy che non blocca l'event loop
+- `async_sessionmaker`       : factory di sessioni async
+- `asyncio.gather()`         : esecuzione parallela di più query indipendenti
 
 Struttura del file
 ------------------
-A. Engine & SessionLocal  — la "connessione" al DB e la factory delle sessioni.
-B. get_db()               — dependency FastAPI: fornisce una Session per ogni
-                            request e garantisce che venga chiusa a fine request.
-C. Funzioni CRUD          — stessa interfaccia di prima (list_all, get, create,
-                            replace, update, delete), ora usano SQLAlchemy.
-D. seed_db()              — inserisce 3 prodotti di esempio se la tabella è vuota.
-
-Cosa è cambiato rispetto alla versione con il dict?
-----------------------------------------------------
-- I dati sopravvivono al riavvio del server (persistenza reale).
-- I filtri diventano clausole WHERE nella query SQL (non più list comprehension).
-- Gli id sono assegnati da PostgreSQL tramite SERIAL (non più itertools.count).
-- La gestione della concorrenza è delegata al DB (transaction isolation).
+A. Engine & AsyncSessionLocal  — connessione al DB e factory delle sessioni.
+B. init_db()                   — crea le tabelle all'avvio (sostituisce create_all
+                                 a livello di modulo, che non funziona con async).
+C. get_db()                    — dependency FastAPI: sessione per ogni request.
+D. Funzioni CRUD (async)       — stessa interfaccia di prima, ora con await.
+E. get_many()                  — fetch parallelo con asyncio.gather().
+F. seed_db()                   — dati di esempio all'avvio.
 """
 
+import asyncio
 import os
+from collections.abc import AsyncGenerator
 
 from dotenv import load_dotenv
-from sqlalchemy import create_engine, select
-from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import (
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
 
 from app.orm import Base, ProductORM
 
 # ---------------------------------------------------------------------------
-# A. Engine & SessionLocal
+# A. Engine & AsyncSessionLocal
 # ---------------------------------------------------------------------------
 
-# Carica DATABASE_URL dal file .env nella cartella del progetto.
 load_dotenv()
-DATABASE_URL = os.environ["DATABASE_URL"]
 
-# `create_engine` crea il motore: gestisce il connection pool e la
-# comunicazione con PostgreSQL.
-#
-# echo=True  →  ogni SQL generato da SQLAlchemy viene stampato su stdout.
-#               Fondamentale durante lo studio: si vede esattamente quale
-#               query viene eseguita per ogni operazione ORM.
-#               In produzione si mette echo=False.
-engine = create_engine(DATABASE_URL, echo=True)
+_raw_url = os.environ["DATABASE_URL"]
 
-# `sessionmaker` restituisce una *factory* di sessioni (non una sessione).
-# Ogni chiamata a SessionLocal() crea una nuova sessione indipendente.
-#
-# autocommit=False  →  dobbiamo chiamare db.commit() esplicitamente.
-#                      Questo ci dà controllo sulle transazioni.
-# autoflush=False   →  SQLAlchemy non scrive sul DB prima di ogni query;
-#                      siamo noi a decidere quando fare flush/commit.
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+# asyncpg richiede lo schema `postgresql+asyncpg://`.
+# Supportiamo sia `postgresql://` che `postgresql+asyncpg://` nel .env.
+DATABASE_URL = (
+    _raw_url
+    .replace("postgresql://", "postgresql+asyncpg://", 1)
+    .replace("postgresql+psycopg2://", "postgresql+asyncpg://", 1)
+)
 
-# DDL automatico: crea la tabella "products" se non esiste ancora.
-# Legge la struttura da Base.metadata (popolata da orm.py al momento
-# dell'import di ProductORM).
+# `create_async_engine` crea un engine asincrono: le query restituiscono
+# awaitable invece di bloccare il thread corrente.
 #
-# Nota: in un progetto più maturo si userebbe Alembic per gestire le
-# migrazioni in modo versionato (come git per lo schema del DB).
-Base.metadata.create_all(bind=engine)
+# --- Parametri chiave per la produzione ---
+#
+# pool_size=20
+#   Connessioni aperte in modo permanente nel pool. Ogni connessione può
+#   servire una sola query alla volta; con 20 connessioni si gestiscono 20
+#   query DB concorrenti senza overhead di apertura.
+#
+# max_overflow=10
+#   Connessioni extra consentite quando il pool è pieno. Totale massimo:
+#   20 + 10 = 30 connessioni simultanee. PostgreSQL di default accetta 100.
+#
+# pool_timeout=30
+#   Secondi di attesa per una connessione libera prima di sollevare
+#   TimeoutError. Evita che le richieste restino in coda indefinitamente.
+#
+# pool_recycle=1800
+#   Ricicla le connessioni ogni 30 minuti. Previene errori "connection
+#   closed" causati da firewall/NAT che terminano connessioni TCP idle.
+#
+# pool_pre_ping=True
+#   Prima di usare una connessione dal pool, esegue `SELECT 1` per
+#   verificare che sia ancora viva. Se è morta, ne apre una nuova.
+#   Costo: ~1 ms, ma elimina gli errori "broken pipe" intermittenti.
+engine = create_async_engine(
+    DATABASE_URL,
+    echo=True,           # In produzione: echo=False (o logging configurato)
+    pool_size=20,
+    max_overflow=10,
+    pool_timeout=30,
+    pool_recycle=1800,
+    pool_pre_ping=True,
+)
+
+# `async_sessionmaker` è l'equivalente async di `sessionmaker`.
+#
+# expire_on_commit=False — CRITICO per le sessioni async.
+#   Con SQLAlchemy sync, dopo db.commit() gli attributi degli oggetti ORM
+#   vengono "scaduti" (expired): al prossimo accesso SQLAlchemy li ricarica
+#   con una query. In modalità async questo caricamento implicito
+#   NON è possibile (richiederebbe un await invisibile). Con
+#   expire_on_commit=False gli attributi rimangono validi dopo il commit,
+#   evitando MissingGreenlet / lazy-load errors.
+AsyncSessionLocal = async_sessionmaker(
+    engine,
+    class_=AsyncSession,
+    expire_on_commit=False,
+    autocommit=False,
+    autoflush=False,
+)
 
 
 # ---------------------------------------------------------------------------
-# B. Dependency FastAPI
+# B. init_db — crea le tabelle all'avvio
 # ---------------------------------------------------------------------------
 
-def get_db():
+async def init_db() -> None:
+    """Crea le tabelle DDL se non esistono.
+
+    Con un engine asincrono non si può chiamare `Base.metadata.create_all`
+    a livello di modulo (blocca il thread). Si usa invece `engine.begin()`
+    che restituisce una AsyncConnection e `conn.run_sync()` che esegue
+    funzioni sync nel contesto asincrono.
+
+    Chiamata dal lifespan di main.py prima dello yield.
     """
-    Dependency che fornisce una Session SQLAlchemy per ogni request.
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
 
-    Come funziona il pattern "generator dependency"
-    ------------------------------------------------
-    1. FastAPI chiama get_db() e avanza fino al `yield`.
-    2. Il valore yielded (db) viene iniettato nell'endpoint come argomento.
-    3. Dopo che l'endpoint ha terminato (sia in caso di successo che di
-       eccezione), FastAPI riprende l'esecuzione del generator dal punto
-       dopo il yield — eseguendo sempre il blocco `finally`.
-    4. `db.close()` restituisce la connessione al connection pool.
+
+# ---------------------------------------------------------------------------
+# C. Dependency FastAPI
+# ---------------------------------------------------------------------------
+
+async def get_db() -> AsyncGenerator[AsyncSession, None]:
+    """Dependency che fornisce una AsyncSession per ogni request.
+
+    `async with AsyncSessionLocal() as session` gestisce automaticamente:
+    - apertura della sessione (prende una connessione dal pool)
+    - chiusura della sessione a fine request (restituisce al pool)
+    - rollback in caso di eccezione non gestita
 
     Nei router si usa così:
-        def my_endpoint(db: Session = Depends(get_db)):
-            result = database.get(db, 42)
-            ...
+        async def my_endpoint(db: AsyncSession = Depends(get_db)):
+            result = await database.get(db, 42)
     """
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
+    async with AsyncSessionLocal() as session:
+        yield session
 
 
 # ---------------------------------------------------------------------------
-# C. Funzioni CRUD
+# D. Funzioni CRUD (async)
 # ---------------------------------------------------------------------------
 
-def list_all(
-    db: Session,
+async def list_all(
+    db: AsyncSession,
     category: str | None = None,
     min_price: float | None = None,
     max_price: float | None = None,
 ) -> list[ProductORM]:
-    """
-    Prima (dict):  result = list(_products.values())
-                   result = [p for p in result if p["category"] == category]
-
-    Ora (SQL):     SELECT * FROM products
-                   WHERE category = :category      -- se passato
-                   AND   price >= :min_price        -- se passato
-                   AND   price <= :max_price        -- se passato
-
-    `select(ProductORM)` costruisce la query; i `.where(...)` aggiungono
-    clausole solo se il filtro è stato fornito (query dinamica).
-    `.scalars().all()` esegue la query e restituisce una lista di istanze ORM.
-    """
+    """SELECT con filtri opzionali — non blocca l'event loop."""
     stmt = select(ProductORM)
     if category is not None:
         stmt = stmt.where(ProductORM.category == category)
@@ -120,114 +172,103 @@ def list_all(
         stmt = stmt.where(ProductORM.price >= min_price)
     if max_price is not None:
         stmt = stmt.where(ProductORM.price <= max_price)
-    return db.execute(stmt).scalars().all()
+    result = await db.execute(stmt)
+    return list(result.scalars().all())
 
 
-def get(db: Session, product_id: int) -> ProductORM | None:
-    """
-    Prima (dict):  return _products.get(product_id)
-
-    Ora (SQL):     SELECT * FROM products WHERE id = :id  LIMIT 1
-
-    `db.get()` è lo shortcut di SQLAlchemy per la lookup per PK.
-    Usa l'identity map della sessione: se l'oggetto è già stato caricato
-    in questa sessione, lo restituisce senza fare una query al DB.
-    """
-    return db.get(ProductORM, product_id)
+async def get(db: AsyncSession, product_id: int) -> ProductORM | None:
+    """SELECT per PK. Usa l'identity map se l'oggetto è già in sessione."""
+    return await db.get(ProductORM, product_id)
 
 
-def create(db: Session, data: dict) -> ProductORM:
-    """
-    Prima (dict):  new_id = next(_id_seq)
-                   _products[new_id] = {"id": new_id, **data}
-
-    Ora (SQL):     INSERT INTO products (name, description, price,
-                                         category, stock)
-                   VALUES (:name, :description, :price, :category, :stock)
-                   RETURNING id
-
-    `db.add(product)`  →  aggiunge l'oggetto alla "pending area" della sessione.
-    `db.commit()`      →  esegue INSERT e rende il record permanente.
-    `db.refresh()`     →  rilegge la riga dal DB; ora product.id è popolato
-                           (assegnato da PostgreSQL tramite SERIAL).
-    """
+async def create(db: AsyncSession, data: dict) -> ProductORM:
+    """INSERT — db.add() è sync, commit/refresh sono async."""
     product = ProductORM(**data)
     db.add(product)
-    db.commit()
-    db.refresh(product)
+    await db.commit()
+    # refresh rilegge la riga dal DB: necessario per ottenere l'id
+    # assegnato da PostgreSQL (SERIAL/IDENTITY).
+    await db.refresh(product)
     return product
 
 
-def replace(db: Session, product_id: int, data: dict) -> ProductORM | None:
-    """
-    Prima (dict):  if product_id not in _products: return None
-                   _products[product_id] = {"id": product_id, **data}
-
-    Ora (SQL):     UPDATE products
-                   SET name=:n, description=:d, price=:p, category=:c, stock=:s
-                   WHERE id = :id
-
-    SQLAlchemy traccia le modifiche agli attributi (dirty tracking):
-    quando chiamiamo db.commit(), genera automaticamente un UPDATE con
-    solo le colonne che sono cambiate rispetto allo snapshot iniziale.
-    """
-    product = db.get(ProductORM, product_id)
+async def replace(db: AsyncSession, product_id: int, data: dict) -> ProductORM | None:
+    """UPDATE completo (tutti i campi)."""
+    product = await db.get(ProductORM, product_id)
     if product is None:
         return None
     for key, value in data.items():
         setattr(product, key, value)
-    db.commit()
-    db.refresh(product)
+    await db.commit()
+    await db.refresh(product)
     return product
 
 
-def update(db: Session, product_id: int, patch: dict) -> ProductORM | None:
-    """
-    Identico a `replace`, ma `patch` contiene solo i campi da toccare.
-
-    Prima (dict):  existing.update(patch)
-
-    Ora (SQL):     UPDATE products SET <solo i campi in patch> WHERE id = :id
-
-    Il meccanismo SQLAlchemy è lo stesso di replace: setattr + commit.
-    La differenza è che `patch` arriva già filtrato dal router con
-    `model_dump(exclude_unset=True)`, quindi solo i campi inviati dal client
-    vengono toccati.
-    """
-    product = db.get(ProductORM, product_id)
+async def update(db: AsyncSession, product_id: int, patch: dict) -> ProductORM | None:
+    """UPDATE parziale — `patch` contiene solo i campi da modificare."""
+    product = await db.get(ProductORM, product_id)
     if product is None:
         return None
     for key, value in patch.items():
         setattr(product, key, value)
-    db.commit()
-    db.refresh(product)
+    await db.commit()
+    await db.refresh(product)
     return product
 
 
-def delete(db: Session, product_id: int) -> bool:
-    """
-    Prima (dict):  return _products.pop(product_id, None) is not None
-
-    Ora (SQL):     DELETE FROM products WHERE id = :id
-    """
-    product = db.get(ProductORM, product_id)
+async def delete(db: AsyncSession, product_id: int) -> bool:
+    """DELETE per PK."""
+    product = await db.get(ProductORM, product_id)
     if product is None:
         return False
-    db.delete(product)
-    db.commit()
+    await db.delete(product)
+    await db.commit()
     return True
 
 
 # ---------------------------------------------------------------------------
-# D. Seed
+# E. Fetch parallelo con asyncio.gather()
 # ---------------------------------------------------------------------------
 
-def seed_db(db: Session) -> None:
+async def get_many(product_ids: list[int]) -> list[ProductORM | None]:
+    """Recupera più prodotti in PARALLELO usando asyncio.gather().
+
+    Perché sessioni separate?
+    -------------------------
+    Una singola AsyncSession non è concurrency-safe: non può essere usata
+    da più coroutine contemporaneamente. Per parallelizzare le query, ogni
+    fetch apre la propria sessione dal pool — ogni sessione ottiene una
+    connessione indipendente.
+
+    Con asyncio.gather() le N query partono simultaneamente e si aspettano
+    che finiscano tutte: il tempo totale è max(t1, t2, ..., tN) invece
+    di sum(t1, t2, ..., tN).
+
+    In produzione questo pattern è usato per:
+    - fetch di risorse correlate da tabelle diverse
+    - chiamate a più microservizi in parallelo
+    - enrichment concorrente (es. prezzi + disponibilità + recensioni)
+    """
+    async def _fetch_one(pid: int) -> ProductORM | None:
+        # Ogni task ha la propria sessione → connessione dal pool indipendente.
+        async with AsyncSessionLocal() as session:
+            return await session.get(ProductORM, pid)
+
+    results = await asyncio.gather(*(_fetch_one(pid) for pid in product_ids))
+    return list(results)
+
+
+# ---------------------------------------------------------------------------
+# F. Seed — dati di esempio all'avvio
+# ---------------------------------------------------------------------------
+
+async def seed_db(db: AsyncSession) -> None:
     """Inserisce 3 prodotti di esempio solo se la tabella è vuota.
 
-    Chiamata da main.py nel lifespan dell'app (all'avvio del server).
+    Chiamata da main.py nel lifespan (all'avvio del server).
     """
-    if db.execute(select(ProductORM)).first() is not None:
+    result = await db.execute(select(ProductORM))
+    if result.first() is not None:
         return
     for data in [
         {
@@ -252,4 +293,4 @@ def seed_db(db: Session) -> None:
             "stock": 100,
         },
     ]:
-        create(db, data)
+        await create(db, data)
